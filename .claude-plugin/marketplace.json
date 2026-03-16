@@ -1,10 +1,22 @@
 {
-  "name": "bbf-cwmp-usp",
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "bbf-cwmp-usp-mcp",
   "description": "Broadband Forum CWMP/USP data model and protocol tools",
+  "owner": {
+    "name": "Stechs",
+    "email": "aprincipe@stechs.com"
+  },
   "plugins": [
     {
       "name": "bbf-cwmp-usp",
-      "path": "."
+      "description": "MCP server with semantic search, exact parameter lookup, and tree navigation over TR-181, TR-098, and USP specs",
+      "version": "1.0.0",
+      "author": {
+        "name": "Stechs",
+        "email": "aprincipe@stechs.com"
+      },
+      "source": ".",
+      "category": "development"
     }
   ]
 }

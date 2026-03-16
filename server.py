@@ -7,6 +7,8 @@ Tools:
 - list_objects: list child objects of a path (e.g. Device.WiFi.)
 - search_usp_spec: semantic search over USP specification (TR-369)
 - search_protocol_schema: semantic search over XSD/proto schemas
+- init_data: fetch BBF data from GitHub
+- index_data: index fetched data into vector DB
 """
 import asyncio
 import json
@@ -323,19 +325,49 @@ async def list_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="init_data",
+            description=(
+                "Fetch BBF data model files from GitHub. "
+                "Downloads CWMP/USP XML data models, USP specification, "
+                "and protocol schemas. Run this before index_data. "
+                "Only needs to run once, or to update to latest versions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "github_token": {
+                        "type": "string",
+                        "description": "Optional GitHub token for higher rate limits",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="index_data",
+            description=(
+                "Index fetched BBF data into the vector database for semantic search. "
+                "Parses XML data models and creates embeddings. "
+                "Run after init_data. Takes ~5 minutes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
     ]
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     try:
-        result = _handle_tool(name, arguments)
+        result = await _handle_tool(name, arguments)
     except Exception as e:
         result = f"Error: {e}"
     return [TextContent(type="text", text=_truncate(result))]
 
 
-def _handle_tool(name: str, arguments: dict) -> str:
+async def _handle_tool(name: str, arguments: dict) -> str:
     if name == "search_datamodel":
         return _tool_search_datamodel(arguments)
     elif name == "get_parameter":
@@ -346,6 +378,10 @@ def _handle_tool(name: str, arguments: dict) -> str:
         return _tool_search_usp_spec(arguments)
     elif name == "search_protocol_schema":
         return _tool_search_protocol_schema(arguments)
+    elif name == "init_data":
+        return await _tool_init_data(arguments)
+    elif name == "index_data":
+        return _tool_index_data()
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -452,6 +488,43 @@ def _tool_search_protocol_schema(args: dict) -> str:
             results.append(f"## USP Schema (Protobuf)\n\n{r}")
 
     return "\n\n".join(results) if results else "No results found."
+
+
+async def _tool_init_data(args: dict) -> str:
+    """Fetch BBF data from GitHub."""
+    from bbf_fetcher import BBFDataFetcher
+
+    token = args.get("github_token")
+    fetcher = BBFDataFetcher(github_token=token)
+
+    result = await fetcher.run_init(DATA_DIR)
+
+    lines = [f"Fetched {result.total_files} files to {DATA_DIR}"]
+    for repo_name, info in result.repos.items():
+        lines.append(f"  {repo_name}: {info['files_downloaded']} files")
+    if result.errors:
+        lines.append(f"\nErrors ({len(result.errors)}):")
+        for err in result.errors:
+            lines.append(f"  - {err}")
+        return "\n".join(lines)
+
+    lines.append("\nRun 'index_data' tool next to index the data for search.")
+    return "\n".join(lines)
+
+
+def _tool_index_data() -> str:
+    """Index fetched data into ChromaDB."""
+    from indexer import BBFIndexer
+
+    if not DATA_DIR.exists():
+        return "No data directory found. Run 'init_data' tool first."
+
+    indexer = BBFIndexer(data_dir=DATA_DIR)
+    indexer.run_full_indexing()
+
+    # Reload server state
+    init_server()
+    return "Indexing complete. Server reloaded with new data. All search tools are now available."
 
 
 async def main():

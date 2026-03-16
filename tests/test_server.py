@@ -134,9 +134,10 @@ class TestListObjects:
 
 
 class TestHandleTool:
-    def test_unknown_tool(self):
+    @pytest.mark.asyncio
+    async def test_unknown_tool(self):
         with pytest.raises(ValueError, match="Unknown tool"):
-            server._handle_tool("nonexistent_tool", {})
+            await server._handle_tool("nonexistent_tool", {})
 
     def test_search_datamodel_no_collections(self):
         result = server._tool_search_datamodel({"query": "wifi", "protocol": "cwmp"})

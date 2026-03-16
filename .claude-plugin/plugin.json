@@ -1,0 +1,11 @@
+{
+  "name": "bbf-cwmp-usp",
+  "description": "Broadband Forum CWMP/USP data model and protocol tools. Provides semantic search, exact parameter lookup, and tree navigation over TR-181 Device:2, TR-098, and USP specifications.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Stechs",
+    "email": "aprincipe@stechs.com"
+  },
+  "license": "MIT",
+  "keywords": ["tr-069", "tr-369", "cwmp", "usp", "broadband-forum", "data-model", "tr-181", "mcp"]
+}

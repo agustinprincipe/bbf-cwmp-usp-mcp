@@ -15,7 +15,7 @@
         "name": "Stechs",
         "email": "aprincipe@stechs.com"
       },
-      "source": ".",
+      "source": "./plugins/bbf-cwmp-usp",
       "category": "development"
     }
   ]

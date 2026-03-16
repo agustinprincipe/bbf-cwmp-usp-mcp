@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "bbf-cwmp-usp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "run",
+        "python",
+        "main.py",
+        "serve"
+      ]
+    }
+  }
+}

@@ -16,6 +16,7 @@ The server provides 5 tools. Choosing the right one matters — it's the differe
 | Find parameters by description or feature area | `search_datamodel` | Semantic search — good when you don't know exact paths |
 | Look up a specific parameter or object by path | `get_parameter` | Exact match — instant, no embeddings, complete metadata |
 | Browse what's under a data model path | `list_objects` | Tree navigation — shows direct children with descriptions |
+| Understand CWMP protocol behavior | `search_cwmp_spec` | Searches the TR-069 specification (from PDF) |
 | Understand USP protocol behavior | `search_usp_spec` | Searches the TR-369 specification markdown |
 | Look up CWMP/USP message structures | `search_protocol_schema` | Searches XSD (CWMP) and protobuf (USP) schemas |
 
@@ -31,9 +32,11 @@ The server provides 5 tools. Choosing the right one matters — it's the differe
       └─ search_datamodel
 
 "I need info about protocol behavior"
+  ├─ CWMP (TR-069): procedures, RPC methods, sessions, security
+  │   └─ search_cwmp_spec
   ├─ USP (TR-369): messages, MTPs, security, discovery
   │   └─ search_usp_spec
-  └─ CWMP (TR-069) or USP message schemas
+  └─ CWMP/USP message schemas (XSD/protobuf)
       └─ search_protocol_schema
 ```
 
@@ -89,6 +92,23 @@ Lists direct child objects of a given path. Think of it as "ls" for the data mod
 
 **Note on depth:** Multi-instance objects like `Device.WiFi.Radio.{i}.` appear deeper than expected because `{i}` counts as an extra level. If `list_objects` returns no children for a path you expect to have sub-objects, the children might be two levels down. Try `search_datamodel` with the parent path name to discover them.
 
+### `search_cwmp_spec` — CWMP specification search
+
+Searches the TR-069 CWMP specification (276-page PDF, extracted to markdown via pymupdf4llm). Covers the full protocol: architecture, procedures, RPC methods, session management, security, XMPP, proxy management, firmware management, and all annexes.
+
+**Parameters:**
+- `query` (required): what you're looking for
+- `top_k` (optional, default 5): number of results
+
+**Good for:**
+- CWMP session procedures (CPE/ACS operation, version negotiation)
+- RPC method behavior (Inform, GetParameterValues, Download, etc.)
+- Connection request mechanisms (HTTP, XMPP, NAT traversal)
+- Security: TLS, authentication, digest auth
+- Proxy management (virtual CWMP device, embedded object mechanism)
+- Software module management, firmware image handling
+- HTTP bulk data collection, UDP lightweight notifications
+
 ### `search_usp_spec` — USP specification search
 
 Searches the TR-369 USP specification (20 markdown files from the official repo). Covers architecture, messages, MTPs, security, discovery, extensions.
@@ -143,8 +163,12 @@ When you need to find what parameters exist for something:
 
 ### Understand a protocol message
 
-1. `search_usp_spec` or `search_protocol_schema` for protocol behavior
+1. `search_cwmp_spec` or `search_usp_spec` for protocol behavior
 2. `search_protocol_schema` for the exact message structure
+
+**Example:** "How does CWMP Inform work?"
+→ `search_cwmp_spec(query="Inform RPC session procedure")`
+→ `search_protocol_schema(query="Inform", protocol="cwmp")`
 
 **Example:** "How does USP Notify work?"
 → `search_usp_spec(query="Notify message subscription")`
@@ -160,7 +184,7 @@ When you need to find what parameters exist for something:
 - **Using search when you know the path**: `get_parameter` is instant and exact. Use `search_datamodel` only when you're exploring or don't know the path.
 - **Forgetting protocol filter**: CWMP and USP data models are similar but not identical. If you need protocol-specific parameters, set the `protocol` filter.
 - **TR-098 vs TR-181**: TR-098 uses `InternetGatewayDevice.*` paths (legacy CWMP). TR-181 uses `Device.*` paths (modern, both protocols). Both are in the `cwmp` collection.
-- **Missing the CWMP spec**: The server currently indexes the USP specification markdown but not the TR-069 specification text (only the CWMP XSD schema). For CWMP protocol behavior questions, search_protocol_schema with protocol "cwmp" searches the XSD, which contains message structures but not the full spec narrative.
+- **CWMP spec vs schema**: `search_cwmp_spec` searches the full TR-069 specification narrative (procedures, requirements, behavior). `search_protocol_schema` with protocol "cwmp" searches the XSD schema (message structures, data types). Use the spec for "how does X work?" and the schema for "what fields does message X have?".
 
 ## Setup
 

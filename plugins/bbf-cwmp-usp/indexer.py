@@ -24,6 +24,7 @@ class BBFIndexer:
     COLLECTIONS = [
         "cwmp_datamodel",
         "usp_datamodel",
+        "cwmp_spec",
         "usp_spec",
         "cwmp_protocols",
         "usp_protocols",
@@ -221,6 +222,43 @@ class BBFIndexer:
 
         return chunk_id
 
+    def index_pdf_as_markdown(self, pdf_path: Path, collection_name: str) -> int:
+        """Extract text from a PDF via pymupdf4llm and index into ChromaDB."""
+        import pymupdf4llm
+
+        print(f"  Extracting markdown from {pdf_path.name}...", file=stderr)
+        md_text = pymupdf4llm.to_markdown(str(pdf_path))
+
+        if not md_text.strip():
+            print(f"  No text extracted from {pdf_path.name}", file=stderr)
+            return 0
+
+        client = self._get_client()
+        try:
+            client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+        collection = client.create_collection(name=collection_name)
+
+        chunks = self._chunk_text(md_text)
+        chunk_id = 0
+
+        for chunk_idx, chunk in enumerate(chunks):
+            embedding = self.model.encode([chunk])
+            collection.add(
+                embeddings=embedding,
+                documents=[chunk],
+                metadatas=[{
+                    "source": pdf_path.name,
+                    "chunk": f"{chunk_idx + 1}/{len(chunks)}",
+                }],
+                ids=[str(chunk_id)],
+            )
+            chunk_id += 1
+
+        print(f"  {pdf_path.name}: {chunk_id} chunks", file=stderr)
+        return chunk_id
+
     def run_full_indexing(self):
         """Run complete indexing pipeline."""
         print("=" * 60, file=stderr)
@@ -317,14 +355,24 @@ class BBFIndexer:
         else:
             print("  USP spec directory not found", file=stderr)
 
-        # 4. CWMP protocol schemas (XSD)
+        # 4. CWMP specification (PDF)
+        print("\n[CWMP Specification]", file=stderr)
+        cwmp_spec_dir = self.data_dir / "cwmp-spec"
+        total_cwmp_spec = 0
+        cwmp_pdfs = sorted(cwmp_spec_dir.glob("*.pdf")) if cwmp_spec_dir.exists() else []
+        if cwmp_pdfs:
+            total_cwmp_spec = self.index_pdf_as_markdown(cwmp_pdfs[0], "cwmp_spec")
+        else:
+            print("  No CWMP spec PDF found", file=stderr)
+
+        # 5. CWMP protocol schemas (XSD)
         print("\n[CWMP Protocol Schemas]", file=stderr)
         cwmp_xsd = sorted(cwmp_dir.glob("*.xsd")) if cwmp_dir.exists() else []
         total_cwmp_proto = self.index_schema_files(cwmp_xsd, "cwmp_protocols")
         if not cwmp_xsd:
             print("  No XSD files found", file=stderr)
 
-        # 5. USP protocol schemas (proto)
+        # 6. USP protocol schemas (proto)
         print("\n[USP Protocol Schemas]", file=stderr)
         usp_protos = sorted(usp_spec_dir.glob("*.proto")) if usp_spec_dir.exists() else []
         total_usp_proto = self.index_schema_files(usp_protos, "usp_protocols")
@@ -336,9 +384,10 @@ class BBFIndexer:
         print("Indexing Complete!", file=stderr)
         print(f"  CWMP data model: {total_cwmp} chunks", file=stderr)
         print(f"  USP data model:  {total_usp} chunks", file=stderr)
+        print(f"  CWMP spec:       {total_cwmp_spec} chunks", file=stderr)
         print(f"  USP spec:        {total_spec} chunks", file=stderr)
         print(f"  CWMP protocols:  {total_cwmp_proto} chunks", file=stderr)
         print(f"  USP protocols:   {total_usp_proto} chunks", file=stderr)
-        total = total_cwmp + total_usp + total_spec + total_cwmp_proto + total_usp_proto
+        total = total_cwmp + total_usp + total_cwmp_spec + total_spec + total_cwmp_proto + total_usp_proto
         print(f"  TOTAL:           {total} chunks", file=stderr)
         print("=" * 60, file=stderr)

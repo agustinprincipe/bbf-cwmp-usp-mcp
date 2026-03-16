@@ -16,6 +16,15 @@ import httpx
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 
+# Direct downloads (files not available via GitHub repos)
+DIRECT_DOWNLOADS: dict[str, dict] = {
+    "cwmp-spec": {
+        "url": "https://www.broadband-forum.org/pdfs/tr-069-1-6-1.pdf",
+        "filename": "tr-069-amendment-6-corrigendum-1.pdf",
+        "description": "TR-069 CWMP Specification (Amendment 6 Corrigendum 1)",
+    },
+}
+
 # Repo configurations: patterns to match and how to select files
 REPOS: dict[str, dict] = {
     "cwmp-data-models": {
@@ -186,6 +195,35 @@ class BBFDataFetcher:
 
         return dest
 
+    async def download_direct_files(
+        self, client: httpx.AsyncClient, data_dir: Path
+    ) -> tuple[int, list[str]]:
+        """Download files from direct URLs (not GitHub repos).
+
+        Returns (count, errors) tuple.
+        """
+        count = 0
+        errors = []
+
+        for dest_name, config in DIRECT_DOWNLOADS.items():
+            dest_path = data_dir / dest_name / config["filename"]
+            if dest_path.exists():
+                count += 1
+                continue
+
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                async with client.stream("GET", config["url"]) as response:
+                    response.raise_for_status()
+                    with open(dest_path, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
+                count += 1
+            except httpx.HTTPError as e:
+                errors.append(f"Failed to download {config['description']}: {e}")
+
+        return count, errors
+
     async def run_init(self, data_dir: Path) -> InitResult:
         """Run the full init/onboarding process.
 
@@ -274,6 +312,18 @@ class BBFDataFetcher:
                 result.repos[repo_name] = {
                     "files_downloaded": len(downloaded),
                     "tree_sha": tree_sha,
+                }
+
+            # Download direct files (PDFs, etc.)
+            direct_count, direct_errors = await self.download_direct_files(
+                client, data_dir
+            )
+            result.total_files += direct_count
+            result.errors.extend(direct_errors)
+            if direct_count:
+                manifest["direct_downloads"] = {
+                    name: config["filename"]
+                    for name, config in DIRECT_DOWNLOADS.items()
                 }
 
         # Write manifest

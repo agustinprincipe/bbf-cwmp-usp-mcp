@@ -5,6 +5,7 @@ Tools:
 - search_datamodel: semantic search over CWMP/USP data model objects and parameters
 - get_parameter: exact path lookup (e.g. Device.WiFi.SSID.1.SSID)
 - list_objects: list child objects of a path (e.g. Device.WiFi.)
+- search_cwmp_spec: semantic search over CWMP specification (TR-069)
 - search_usp_spec: semantic search over USP specification (TR-369)
 - search_protocol_schema: semantic search over XSD/proto schemas
 - init_data: fetch BBF data from GitHub
@@ -72,7 +73,7 @@ def init_server():
     if VECTOR_DB_DIR.exists():
         try:
             client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-            for name in ["cwmp_datamodel", "usp_datamodel", "usp_spec", "cwmp_protocols", "usp_protocols"]:
+            for name in ["cwmp_datamodel", "usp_datamodel", "cwmp_spec", "usp_spec", "cwmp_protocols", "usp_protocols"]:
                 try:
                     collections[name] = client.get_collection(name)
                     count = collections[name].count()
@@ -294,6 +295,34 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="search_cwmp_spec",
+            description=(
+                "Search the CWMP (TR-069) specification. "
+                "Returns relevant sections from the TR-069 spec covering: "
+                "architecture, procedures, RPC methods, session management, "
+                "security, XMPP connection requests, proxy management, "
+                "firmware management, and protocol requirements."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Search query. Examples: 'Inform RPC procedure', "
+                            "'connection request mechanism', 'session retry policy'"
+                        ),
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of results (default: 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
             name="search_protocol_schema",
             description=(
                 "Search protocol schema definitions. "
@@ -376,6 +405,8 @@ async def _handle_tool(name: str, arguments: dict) -> str:
         return _tool_list_objects(arguments)
     elif name == "search_usp_spec":
         return _tool_search_usp_spec(arguments)
+    elif name == "search_cwmp_spec":
+        return _tool_search_cwmp_spec(arguments)
     elif name == "search_protocol_schema":
         return _tool_search_protocol_schema(arguments)
     elif name == "init_data":
@@ -470,6 +501,10 @@ def _tool_list_objects(args: dict) -> str:
 
 def _tool_search_usp_spec(args: dict) -> str:
     return _semantic_search("usp_spec", args["query"], args.get("top_k", 5))
+
+
+def _tool_search_cwmp_spec(args: dict) -> str:
+    return _semantic_search("cwmp_spec", args["query"], args.get("top_k", 5))
 
 
 def _tool_search_protocol_schema(args: dict) -> str:

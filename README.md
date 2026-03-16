@@ -6,11 +6,19 @@ MCP server for querying Broadband Forum data models and protocol specifications.
 
 ### As a Claude Code Plugin (recommended)
 
-```bash
-claude plugin add git@github.com:agustinprincipe/bbf-cwmp-usp-mcp.git
+Inside Claude Code, run:
+```
+/plugin marketplace add agustinprincipe/bbf-cwmp-usp-mcp
+/plugin install bbf-cwmp-usp@bbf-cwmp-usp-mcp
 ```
 
-The server auto-starts with Claude Code. On first use, run the setup tools from within Claude:
+Or with the full SSH URL:
+```
+/plugin marketplace add git@github.com:agustinprincipe/bbf-cwmp-usp-mcp.git
+/plugin install bbf-cwmp-usp@bbf-cwmp-usp-mcp
+```
+
+The MCP server auto-starts with Claude Code. On first use, run the setup tools from within Claude:
 - `init_data` — fetches BBF data from GitHub (~12MB)
 - `index_data` — indexes into vector DB (~5 min)
 

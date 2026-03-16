@@ -8,14 +8,14 @@ MCP server for querying Broadband Forum data models and protocol specifications.
 
 Inside Claude Code, run:
 ```
-/plugin marketplace add agustinprincipe/bbf-cwmp-usp-mcp
-/plugin install bbf-cwmp-usp@bbf-cwmp-usp-mcp
+/plugin marketplace add agustinprincipe/claude-plugins
+/plugin install bbf-cwmp-usp@claude-plugins
 ```
 
 Or with the full SSH URL:
 ```
-/plugin marketplace add git@github.com:agustinprincipe/bbf-cwmp-usp-mcp.git
-/plugin install bbf-cwmp-usp@bbf-cwmp-usp-mcp
+/plugin marketplace add git@github.com:agustinprincipe/claude-plugins.git
+/plugin install bbf-cwmp-usp@claude-plugins
 ```
 
 The MCP server auto-starts with Claude Code. On first use, run the setup tools from within Claude:
@@ -25,7 +25,7 @@ The MCP server auto-starts with Claude Code. On first use, run the setup tools f
 ### Manual Setup
 
 ```bash
-git clone git@github.com:agustinprincipe/bbf-cwmp-usp-mcp.git
+git clone git@github.com:agustinprincipe/claude-plugins.git
 cd bbf-cwmp-usp-mcp
 uv sync
 uv run python main.py init     # fetch data

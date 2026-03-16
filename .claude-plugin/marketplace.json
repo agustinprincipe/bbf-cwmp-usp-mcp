@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "bbf-cwmp-usp-mcp",
+  "name": "claude-plugins",
   "description": "Broadband Forum CWMP/USP data model and protocol tools",
   "owner": {
     "name": "Stechs",

@@ -12,8 +12,7 @@ license = {text = "MIT"}
 
 dependencies = [
     "chromadb>=1.2.1",
-    "docling>=2.58.0",
-    "mcp>=1.16.0",
+"mcp>=1.16.0",
     "sentence-transformers>=5.1.2",
     "protobuf>=5.29.0",
     "httpx>=0.28.1",

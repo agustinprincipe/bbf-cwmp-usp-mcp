@@ -29,6 +29,18 @@ async def run_init(github_token: str | None = None) -> None:
         sys.exit(1)
 
 
+def run_index() -> None:
+    """Index fetched BBF data into ChromaDB."""
+    from indexer import BBFIndexer
+
+    if not DATA_DIR.exists():
+        print("No data directory found. Run 'python main.py init' first.")
+        sys.exit(1)
+
+    indexer = BBFIndexer(data_dir=DATA_DIR)
+    indexer.run_full_indexing()
+
+
 async def run_serve() -> None:
     """Start the MCP server."""
     from server import main as server_main
@@ -46,6 +58,9 @@ def cli() -> None:
         "--token", help="GitHub personal access token (optional, increases rate limit)"
     )
 
+    # index command
+    subparsers.add_parser("index", help="Index fetched BBF data into vector DB")
+
     # serve command (default)
     subparsers.add_parser("serve", help="Start the MCP server (default)")
 
@@ -53,6 +68,8 @@ def cli() -> None:
 
     if args.command == "init":
         asyncio.run(run_init(github_token=args.token))
+    elif args.command == "index":
+        run_index()
     else:
         # Default to serve
         asyncio.run(run_serve())

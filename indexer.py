@@ -1,160 +1,196 @@
 """
-Unified TR-069 (CWMP) and TR-369 (USP) Documentation Indexer
+BBF Data Model Indexer
 
-Handles PDF conversion and vector database indexing for:
-- TR-069 standard documents and CWMP protocols (XSD/XML)
-- TR-369 standard documents and USP protocols (protobuf)
-- Shared data models (TR-181)
-- Protocol-specific data models (TR-098 for TR-069)
+Indexes BBF data from data/ directory (fetched by bbf_fetcher.py):
+- XML data models (CWMP + USP) via BBFXMLParser -> ChromaDB semantic chunks
+- USP specification markdown -> ChromaDB semantic chunks
+- Protocol schemas (XSD/proto) -> ChromaDB semantic chunks
 """
 import chromadb
 from sentence_transformers import SentenceTransformer
-from docling.document_converter import DocumentConverter
 from pathlib import Path
-import glob
-from typing import Literal, Optional
+from sys import stderr
+
+from xml_parser import BBFXMLParser, DataModel
 
 
-class UnifiedTRIndexer:
-    """Unified indexer for TR-069 and TR-369 documentation."""
+DATA_DIR = Path("data")
+VECTOR_DB_DIR = DATA_DIR / "vector_db"
+
+
+class BBFIndexer:
+    """Indexes BBF data models, specs, and protocol schemas into ChromaDB."""
+
+    COLLECTIONS = [
+        "cwmp_datamodel",
+        "usp_datamodel",
+        "usp_spec",
+        "cwmp_protocols",
+        "usp_protocols",
+    ]
 
     def __init__(
         self,
-        data_dir: str = "data",
+        data_dir: Path = DATA_DIR,
         model_name: str = "all-MiniLM-L6-v2",
-        chunk_size: int = 5000
+        chunk_size: int = 3000,
     ):
-        """
-        Initialize the unified indexer.
-
-        Args:
-            data_dir: Root directory containing tr069/, tr369/, and shared/ subdirectories
-            model_name: Sentence transformer model for embeddings
-            chunk_size: Maximum characters per chunk for protocol files
-        """
-        self.data_dir = Path(data_dir)
+        self.data_dir = data_dir
+        self.vector_db_dir = data_dir / "vector_db"
         self.chunk_size = chunk_size
 
-        # Directory structure
-        self.tr069_dir = self.data_dir / "tr069"
-        self.tr369_dir = self.data_dir / "tr369"
-        self.shared_dir = self.data_dir / "shared"
-
-        # Initialize embedding model
-        print(f"Loading embedding model: {model_name}")
+        print(f"Loading embedding model: {model_name}", file=stderr)
         self.model = SentenceTransformer(model_name)
 
-        # Collections will be stored separately
-        self.collections = {}
+    def _get_client(self) -> chromadb.PersistentClient:
+        self.vector_db_dir.mkdir(parents=True, exist_ok=True)
+        return chromadb.PersistentClient(path=str(self.vector_db_dir))
 
-    def _get_chroma_client(self, protocol: Literal["tr069", "tr369", "shared"]) -> chromadb.PersistentClient:
-        """Get ChromaDB client for specific protocol."""
-        vector_db_path = self.data_dir / protocol / "vector_db"
-        vector_db_path.mkdir(parents=True, exist_ok=True)
-        return chromadb.PersistentClient(path=str(vector_db_path))
-
-    def _chunk_text(self, text: str, max_chars: int) -> list[str]:
-        """
-        Split text into chunks of approximately max_chars size.
-        Tries to split on paragraph boundaries when possible.
-        """
-        if len(text) <= max_chars:
+    def _chunk_text(self, text: str) -> list[str]:
+        """Split text into chunks on paragraph boundaries."""
+        if len(text) <= self.chunk_size:
             return [text]
 
         chunks = []
-        paragraphs = text.split("\n\n")
-        current_chunk = ""
-
-        for para in paragraphs:
-            if len(current_chunk) + len(para) + 2 > max_chars:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = para
-                else:
-                    # Single paragraph is too large, split by sentences
-                    sentences = para.split(". ")
-                    for sentence in sentences:
-                        if len(current_chunk) + len(sentence) + 2 > max_chars:
-                            if current_chunk:
-                                chunks.append(current_chunk.strip())
-                            current_chunk = sentence + ". "
-                        else:
-                            current_chunk += sentence + ". "
+        current = ""
+        for para in text.split("\n\n"):
+            if len(current) + len(para) + 2 > self.chunk_size:
+                if current:
+                    chunks.append(current.strip())
+                current = para
             else:
-                current_chunk += para + "\n\n"
-
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-
+                current += para + "\n\n"
+        if current.strip():
+            chunks.append(current.strip())
         return chunks
 
-    def convert_pdfs_to_markdown(
-        self,
-        protocol: Literal["tr069", "tr369", "shared"],
-        doc_type: Literal["standards", "data_models"],
-        force: bool = False
-    ):
-        """Convert PDFs to markdown format."""
-        base_dir = self.data_dir / protocol
-        pdf_dir = base_dir / doc_type
-        markdown_dir = base_dir / "markdown" / doc_type
+    def _make_param_doc(self, obj_path: str, param) -> str:
+        """Create a semantic document for a parameter."""
+        parts = [f"Parameter: {obj_path}{param.name}"]
+        parts.append(f"Type: {param.data_type}")
+        parts.append(f"Access: {param.access}")
+        if param.description:
+            parts.append(param.description)
+        if param.enumerations:
+            parts.append(f"Values: {', '.join(param.enumerations)}")
+        if param.range_min is not None or param.range_max is not None:
+            parts.append(f"Range: [{param.range_min}, {param.range_max}]")
+        return "\n".join(parts)
 
-        if not pdf_dir.exists():
-            print(f"Directory not found: {pdf_dir}")
-            return
+    def _make_obj_doc(self, obj) -> str:
+        """Create a semantic document for an object."""
+        parts = [f"Object: {obj.name}"]
+        if obj.is_multi_instance:
+            parts.append(f"Multi-instance (max: {obj.max_entries})")
+        parts.append(f"Access: {obj.access}")
+        if obj.description:
+            parts.append(obj.description)
+        param_names = list(obj.parameters.keys())
+        if param_names:
+            parts.append(f"Parameters: {', '.join(param_names[:20])}")
+            if len(param_names) > 20:
+                parts.append(f"  ... and {len(param_names) - 20} more")
+        return "\n".join(parts)
 
-        markdown_dir.mkdir(parents=True, exist_ok=True)
-        pdf_files = list(pdf_dir.glob("*.pdf"))
+    def index_data_model(self, xml_path: Path, collection_name: str) -> int:
+        """Parse an XML data model and index objects+parameters into ChromaDB."""
+        parser = BBFXMLParser()
+        dm = parser.parse(xml_path)
 
-        if not pdf_files:
-            print(f"No PDF files found in {pdf_dir}")
-            return
+        client = self._get_client()
+        try:
+            client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+        collection = client.create_collection(name=collection_name)
 
-        print(f"\nConverting {len(pdf_files)} PDFs from {pdf_dir}...")
-        converter = DocumentConverter()
+        chunk_id = 0
+        source = xml_path.name
 
-        for pdf_path in pdf_files:
-            markdown_path = markdown_dir / f"{pdf_path.stem}.md"
+        for obj_path, obj in dm.objects.items():
+            # Index the object itself
+            doc = self._make_obj_doc(obj)
+            embedding = self.model.encode([doc])
+            collection.add(
+                embeddings=embedding,
+                documents=[doc],
+                metadatas=[{
+                    "source": source,
+                    "path": obj_path,
+                    "type": "object",
+                    "access": obj.access,
+                    "multi_instance": str(obj.is_multi_instance),
+                }],
+                ids=[str(chunk_id)],
+            )
+            chunk_id += 1
 
-            if markdown_path.exists() and not force:
-                print(f"  ✓ {pdf_path.name} (already converted)")
+            # Index each parameter
+            for param_name, param in obj.parameters.items():
+                doc = self._make_param_doc(obj_path, param)
+                embedding = self.model.encode([doc])
+                collection.add(
+                    embeddings=embedding,
+                    documents=[doc],
+                    metadatas=[{
+                        "source": source,
+                        "path": f"{obj_path}{param_name}",
+                        "type": "parameter",
+                        "data_type": param.data_type,
+                        "access": param.access,
+                    }],
+                    ids=[str(chunk_id)],
+                )
+                chunk_id += 1
+
+        print(f"  {source}: {len(dm.objects)} objects, {chunk_id - len(dm.objects)} params -> {chunk_id} chunks", file=stderr)
+        return chunk_id
+
+    def index_markdown_dir(self, dir_path: Path, collection_name: str) -> int:
+        """Index all markdown files in a directory into ChromaDB."""
+        md_files = sorted(dir_path.rglob("*.md"))
+        if not md_files:
+            print(f"  No markdown files in {dir_path}", file=stderr)
+            return 0
+
+        client = self._get_client()
+        try:
+            client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+        collection = client.create_collection(name=collection_name)
+
+        chunk_id = 0
+        for md_path in md_files:
+            content = md_path.read_text(encoding="utf-8")
+            if not content.strip():
                 continue
 
-            try:
-                print(f"  Converting {pdf_path.name}...")
-                result = converter.convert(str(pdf_path))
-                markdown_content = result.document.export_to_markdown()
+            chunks = self._chunk_text(content)
+            rel_path = md_path.relative_to(dir_path)
 
-                with open(markdown_path, "w", encoding="utf-8") as f:
-                    f.write(markdown_content)
+            for chunk_idx, chunk in enumerate(chunks):
+                embedding = self.model.encode([chunk])
+                collection.add(
+                    embeddings=embedding,
+                    documents=[chunk],
+                    metadatas=[{
+                        "source": str(rel_path),
+                        "chunk": f"{chunk_idx + 1}/{len(chunks)}",
+                    }],
+                    ids=[str(chunk_id)],
+                )
+                chunk_id += 1
 
-                print(f"  ✓ {pdf_path.name} -> {markdown_path.name}")
-            except Exception as e:
-                print(f"  ✗ Error converting {pdf_path.name}: {e}")
+        print(f"  {len(md_files)} files -> {chunk_id} chunks", file=stderr)
+        return chunk_id
 
-    def index_markdown_files(
-        self,
-        protocol: Literal["tr069", "tr369", "shared"],
-        doc_type: Literal["standards", "data_models"],
-        collection_name: str
-    ):
-        """Index markdown files into ChromaDB collection."""
-        base_dir = self.data_dir / protocol
-        markdown_dir = base_dir / "markdown" / doc_type
+    def index_schema_files(self, files: list[Path], collection_name: str) -> int:
+        """Index protocol schema files (XSD, proto) into ChromaDB."""
+        if not files:
+            return 0
 
-        if not markdown_dir.exists():
-            print(f"Markdown directory not found: {markdown_dir}")
-            return
-
-        markdown_files = list(markdown_dir.glob("*.md"))
-        if not markdown_files:
-            print(f"No markdown files found in {markdown_dir}")
-            return
-
-        print(f"\nIndexing {len(markdown_files)} markdown files into '{collection_name}'...")
-
-        # Get or create collection
-        client = self._get_chroma_client(protocol)
+        client = self._get_client()
         try:
             client.delete_collection(name=collection_name)
         except Exception:
@@ -162,214 +198,147 @@ class UnifiedTRIndexer:
         collection = client.create_collection(name=collection_name)
 
         chunk_id = 0
-        for md_path in markdown_files:
+        for file_path in files:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            if not content.strip():
+                continue
+
+            chunks = self._chunk_text(content)
+            for chunk_idx, chunk in enumerate(chunks):
+                embedding = self.model.encode([chunk])
+                collection.add(
+                    embeddings=embedding,
+                    documents=[chunk],
+                    metadatas=[{
+                        "source": file_path.name,
+                        "chunk": f"{chunk_idx + 1}/{len(chunks)}",
+                    }],
+                    ids=[str(chunk_id)],
+                )
+                chunk_id += 1
+
+            print(f"  {file_path.name}: {len(chunks)} chunks", file=stderr)
+
+        return chunk_id
+
+    def run_full_indexing(self):
+        """Run complete indexing pipeline."""
+        print("=" * 60, file=stderr)
+        print("BBF Data Indexer", file=stderr)
+        print("=" * 60, file=stderr)
+
+        cwmp_dir = self.data_dir / "cwmp"
+        usp_dir = self.data_dir / "usp"
+        usp_spec_dir = self.data_dir / "usp-spec"
+
+        # 1. CWMP data models
+        print("\n[CWMP Data Models]", file=stderr)
+        cwmp_xmls = sorted(cwmp_dir.glob("*-full.xml")) if cwmp_dir.exists() else []
+        total_cwmp = 0
+        if cwmp_xmls:
+            # Index the main full XMLs into one collection
+            # We process each file and accumulate into the same collection
+            # For simplicity, index the largest (latest) one
+            for xml_path in cwmp_xmls:
+                # Each XML gets its own sub-indexing but same collection approach
+                # Actually, we want TR-181 CWMP and TR-098 in the same collection
+                pass
+
+            # Index all full XMLs together
+            client = self._get_client()
             try:
-                with open(md_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                client.delete_collection(name="cwmp_datamodel")
+            except Exception:
+                pass
+            collection = client.create_collection(name="cwmp_datamodel")
 
-                if not content.strip():
-                    continue
+            chunk_id = 0
+            parser = BBFXMLParser()
+            for xml_path in cwmp_xmls:
+                dm = parser.parse(xml_path)
+                source = xml_path.name
 
-                # Split into chunks by double newline (paragraphs)
-                chunks = content.split("\n\n")
-                chunks = [c.strip() for c in chunks if c.strip()]
-
-                print(f"  {md_path.name}: {len(chunks)} chunks")
-
-                for chunk in chunks:
-                    embedding = self.model.encode([chunk])
+                for obj_path, obj in dm.objects.items():
+                    doc = self._make_obj_doc(obj)
+                    embedding = self.model.encode([doc])
                     collection.add(
                         embeddings=embedding,
-                        documents=[chunk],
+                        documents=[doc],
                         metadatas=[{
-                            "source": str(md_path),
-                            "doc_type": doc_type,
-                            "protocol": protocol
+                            "source": source,
+                            "path": obj_path,
+                            "type": "object",
+                            "access": obj.access,
+                            "multi_instance": str(obj.is_multi_instance),
                         }],
-                        ids=[str(chunk_id)]
+                        ids=[str(chunk_id)],
                     )
                     chunk_id += 1
 
-            except Exception as e:
-                print(f"  ✗ Error indexing {md_path.name}: {e}")
+                    for param_name, param in obj.parameters.items():
+                        doc = self._make_param_doc(obj_path, param)
+                        embedding = self.model.encode([doc])
+                        collection.add(
+                            embeddings=embedding,
+                            documents=[doc],
+                            metadatas=[{
+                                "source": source,
+                                "path": f"{obj_path}{param_name}",
+                                "type": "parameter",
+                                "data_type": param.data_type,
+                                "access": param.access,
+                            }],
+                            ids=[str(chunk_id)],
+                        )
+                        chunk_id += 1
 
-        print(f"  ✓ Indexed {chunk_id} chunks total")
+                print(f"  {source}: {len(dm.objects)} objects indexed", file=stderr)
 
-    def index_protocol_files(
-        self,
-        protocol: Literal["tr069", "tr369"],
-        collection_name: str
-    ):
-        """
-        Index protocol files (XSD/XML for TR-069, .proto for TR-369).
-        """
-        base_dir = self.data_dir / protocol
-        protocol_dir = base_dir / "protocols"
+            total_cwmp = chunk_id
+            print(f"  Total: {total_cwmp} chunks", file=stderr)
+        else:
+            print("  No CWMP XML files found", file=stderr)
 
-        if not protocol_dir.exists():
-            print(f"Protocol directory not found: {protocol_dir}")
-            return
+        # 2. USP data model
+        print("\n[USP Data Models]", file=stderr)
+        usp_xmls = sorted(usp_dir.glob("*-full.xml")) if usp_dir.exists() else []
+        total_usp = 0
+        if usp_xmls:
+            # Use index_data_model for single file, or inline for multiple
+            total_usp = self.index_data_model(usp_xmls[0], "usp_datamodel")
+        else:
+            print("  No USP XML files found", file=stderr)
 
-        # Determine file extensions based on protocol
-        if protocol == "tr069":
-            file_patterns = ["**/*.xml", "**/*.xsd", "**/*.xls"]
-            file_desc = "CWMP XSD/XML files"
-        else:  # tr369
-            file_patterns = ["**/*.proto"]
-            file_desc = "USP protobuf files"
+        # 3. USP specification (markdown)
+        print("\n[USP Specification]", file=stderr)
+        total_spec = 0
+        if usp_spec_dir.exists():
+            total_spec = self.index_markdown_dir(usp_spec_dir, "usp_spec")
+        else:
+            print("  USP spec directory not found", file=stderr)
 
-        # Collect all matching files
-        files_to_index = []
-        for pattern in file_patterns:
-            files_to_index.extend(glob.glob(str(protocol_dir / pattern), recursive=True))
+        # 4. CWMP protocol schemas (XSD)
+        print("\n[CWMP Protocol Schemas]", file=stderr)
+        cwmp_xsd = sorted(cwmp_dir.glob("*.xsd")) if cwmp_dir.exists() else []
+        total_cwmp_proto = self.index_schema_files(cwmp_xsd, "cwmp_protocols")
+        if not cwmp_xsd:
+            print("  No XSD files found", file=stderr)
 
-        if not files_to_index:
-            print(f"No {file_desc} found in {protocol_dir}")
-            return
+        # 5. USP protocol schemas (proto)
+        print("\n[USP Protocol Schemas]", file=stderr)
+        usp_protos = sorted(usp_spec_dir.glob("*.proto")) if usp_spec_dir.exists() else []
+        total_usp_proto = self.index_schema_files(usp_protos, "usp_protocols")
+        if not usp_protos:
+            print("  No proto files found", file=stderr)
 
-        print(f"\nIndexing {len(files_to_index)} {file_desc} into '{collection_name}'...")
-
-        # Get or create collection
-        client = self._get_chroma_client(protocol)
-        try:
-            client.delete_collection(name=collection_name)
-        except Exception:
-            pass
-        collection = client.create_collection(name=collection_name)
-
-        chunk_id = 0
-        for file_path in files_to_index:
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-
-                if not content.strip():
-                    continue
-
-                # Chunk large files
-                chunks = self._chunk_text(content, self.chunk_size)
-
-                for chunk_idx, chunk in enumerate(chunks):
-                    embedding = self.model.encode([chunk])
-                    collection.add(
-                        embeddings=embedding,
-                        documents=[chunk],
-                        metadatas=[{
-                            "source": file_path,
-                            "chunk": f"{chunk_idx + 1}/{len(chunks)}",
-                            "protocol": protocol
-                        }],
-                        ids=[str(chunk_id)]
-                    )
-                    chunk_id += 1
-
-                if len(chunks) > 1:
-                    print(f"  {Path(file_path).name}: {len(chunks)} chunks")
-                else:
-                    print(f"  {Path(file_path).name}")
-
-            except Exception as e:
-                print(f"  ✗ Error indexing {file_path}: {e}")
-
-        print(f"  ✓ Indexed {chunk_id} chunks total")
-
-    def run_full_indexing(
-        self,
-        convert_pdfs: bool = True,
-        force_conversion: bool = False,
-        protocols: Optional[list[str]] = None
-    ):
-        """
-        Run complete indexing pipeline for all protocols.
-
-        Args:
-            convert_pdfs: Whether to convert PDFs to markdown
-            force_conversion: Force reconversion even if markdown exists
-            protocols: List of protocols to index (default: all)
-        """
-        if protocols is None:
-            protocols = ["tr069", "tr369", "shared"]
-
-        print("=" * 80)
-        print("TR-069 (CWMP) & TR-369 (USP) Unified Indexer")
-        print("=" * 80)
-
-        # TR-069 (CWMP)
-        if "tr069" in protocols:
-            print("\n" + "=" * 80)
-            print("TR-069 (CWMP) Processing")
-            print("=" * 80)
-
-            if convert_pdfs:
-                self.convert_pdfs_to_markdown("tr069", "standards", force_conversion)
-                self.convert_pdfs_to_markdown("tr069", "data_models", force_conversion)
-
-            self.index_markdown_files("tr069", "standards", "tr069_standards")
-            self.index_markdown_files("tr069", "data_models", "tr069_data_models")
-            self.index_protocol_files("tr069", "tr069_protocols")
-
-        # TR-369 (USP)
-        if "tr369" in protocols:
-            print("\n" + "=" * 80)
-            print("TR-369 (USP) Processing")
-            print("=" * 80)
-
-            if convert_pdfs:
-                self.convert_pdfs_to_markdown("tr369", "standards", force_conversion)
-
-            self.index_markdown_files("tr369", "standards", "tr369_standards")
-            self.index_protocol_files("tr369", "tr369_protocols")
-
-        # Shared (TR-181)
-        if "shared" in protocols:
-            print("\n" + "=" * 80)
-            print("Shared Data Models (TR-181) Processing")
-            print("=" * 80)
-
-            if convert_pdfs:
-                self.convert_pdfs_to_markdown("shared", "data_models", force_conversion)
-
-            self.index_markdown_files("shared", "data_models", "shared_data_models")
-
-        print("\n" + "=" * 80)
-        print("Indexing Complete!")
-        print("=" * 80)
-
-
-def main():
-    """Main entry point for the indexer."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Index TR-069 and TR-369 documentation"
-    )
-    parser.add_argument(
-        "--protocols",
-        nargs="+",
-        choices=["tr069", "tr369", "shared"],
-        default=["tr069", "tr369", "shared"],
-        help="Which protocols to index (default: all)"
-    )
-    parser.add_argument(
-        "--skip-pdf-conversion",
-        action="store_true",
-        help="Skip PDF to markdown conversion"
-    )
-    parser.add_argument(
-        "--force-conversion",
-        action="store_true",
-        help="Force reconversion of PDFs even if markdown exists"
-    )
-
-    args = parser.parse_args()
-
-    indexer = UnifiedTRIndexer()
-    indexer.run_full_indexing(
-        convert_pdfs=not args.skip_pdf_conversion,
-        force_conversion=args.force_conversion,
-        protocols=args.protocols
-    )
-
-
-if __name__ == "__main__":
-    main()
+        # Summary
+        print(f"\n{'=' * 60}", file=stderr)
+        print("Indexing Complete!", file=stderr)
+        print(f"  CWMP data model: {total_cwmp} chunks", file=stderr)
+        print(f"  USP data model:  {total_usp} chunks", file=stderr)
+        print(f"  USP spec:        {total_spec} chunks", file=stderr)
+        print(f"  CWMP protocols:  {total_cwmp_proto} chunks", file=stderr)
+        print(f"  USP protocols:   {total_usp_proto} chunks", file=stderr)
+        total = total_cwmp + total_usp + total_spec + total_cwmp_proto + total_usp_proto
+        print(f"  TOTAL:           {total} chunks", file=stderr)
+        print("=" * 60, file=stderr)

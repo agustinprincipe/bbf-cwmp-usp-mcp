@@ -1,12 +1,15 @@
 """
-Unified TR-069 (CWMP) and TR-369 (USP) MCP Server
+BBF CWMP/USP MCP Server
 
-Provides tools for searching:
-- TR-069 and TR-369 standard specifications
-- Data models (TR-098 for TR-069, TR-181 shared)
-- Protocol definitions (CWMP XSD/XML for TR-069, protobuf for TR-369)
+Tools:
+- search_datamodel: semantic search over CWMP/USP data model objects and parameters
+- get_parameter: exact path lookup (e.g. Device.WiFi.SSID.1.SSID)
+- list_objects: list child objects of a path (e.g. Device.WiFi.)
+- search_usp_spec: semantic search over USP specification (TR-369)
+- search_protocol_schema: semantic search over XSD/proto schemas
 """
 import asyncio
+import json
 from pathlib import Path
 from sys import stderr
 from typing import Any, Sequence
@@ -17,80 +20,163 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from sentence_transformers import SentenceTransformer
 
-# Initialize
+from xml_parser import BBFXMLParser, DataModel
+
 DATA_DIR = Path(__file__).parent / "data"
+VECTOR_DB_DIR = DATA_DIR / "vector_db"
 
-app = Server("tr-mcp-server")
+app = Server("bbf-mcp-server")
 
-# Global state for vector stores
-chroma_clients = {}
-collections = {}
-model = None
+# Global state
+collections: dict[str, Any] = {}
+model: SentenceTransformer | None = None
+data_models: dict[str, DataModel] = {}  # protocol -> DataModel for exact lookups
 
 
-def init_vector_store():
-    """Initialize ChromaDB clients and embedding model for all protocols."""
-    global chroma_clients, collections, model
+def _load_data_models():
+    """Load parsed XML data models into memory for exact lookups."""
+    parser = BBFXMLParser()
 
+    cwmp_dir = DATA_DIR / "cwmp"
+    usp_dir = DATA_DIR / "usp"
+
+    # Load CWMP data models
+    for xml_path in sorted(cwmp_dir.glob("*-full.xml")) if cwmp_dir.exists() else []:
+        key = "cwmp-tr098" if "tr-098" in xml_path.name else "cwmp"
+        dm = parser.parse(xml_path)
+        data_models[key] = dm
+        print(f"  Loaded {xml_path.name}: {len(dm.objects)} objects", file=stderr)
+
+    # Load USP data model
+    for xml_path in sorted(usp_dir.glob("*-full.xml")) if usp_dir.exists() else []:
+        dm = parser.parse(xml_path)
+        data_models["usp"] = dm
+        print(f"  Loaded {xml_path.name}: {len(dm.objects)} objects", file=stderr)
+
+
+def init_server():
+    """Initialize embedding model, ChromaDB collections, and in-memory data models."""
+    global model
+
+    # Embedding model
     try:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("✅ Embedding model loaded", file=stderr)
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        print("Embedding model loaded", file=stderr)
     except Exception as e:
-        print(f"⚠️  Failed to load embedding model: {e}", file=stderr)
+        print(f"Failed to load embedding model: {e}", file=stderr)
         return
 
-    # Initialize TR-069 collections
-    try:
-        tr069_client = chromadb.PersistentClient(path=str(DATA_DIR / "tr069/vector_db"))
-        chroma_clients["tr069"] = tr069_client
+    # ChromaDB collections
+    if VECTOR_DB_DIR.exists():
+        try:
+            client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
+            for name in ["cwmp_datamodel", "usp_datamodel", "usp_spec", "cwmp_protocols", "usp_protocols"]:
+                try:
+                    collections[name] = client.get_collection(name)
+                    count = collections[name].count()
+                    print(f"  Collection '{name}': {count} docs", file=stderr)
+                except Exception:
+                    print(f"  Collection '{name}' not found", file=stderr)
+        except Exception as e:
+            print(f"Failed to load ChromaDB: {e}", file=stderr)
+    else:
+        print("Vector DB not found. Run 'python main.py index' first.", file=stderr)
 
-        collections["tr069_standards"] = tr069_client.get_collection("tr069_standards")
-        collections["tr069_data_models"] = tr069_client.get_collection("tr069_data_models")
-        collections["tr069_protocols"] = tr069_client.get_collection("tr069_protocols")
-        print("✅ TR-069 (CWMP) collections loaded", file=stderr)
-    except Exception as e:
-        print(f"⚠️  TR-069 collections not found: {e}", file=stderr)
-        print("   Please run: python indexer.py --protocols tr069", file=stderr)
+    # In-memory data models for exact lookups
+    print("Loading data models...", file=stderr)
+    _load_data_models()
 
-    # Initialize TR-369 collections
-    try:
-        tr369_client = chromadb.PersistentClient(path=str(DATA_DIR / "tr369/vector_db"))
-        chroma_clients["tr369"] = tr369_client
+    if not collections and not data_models:
+        print("No data loaded. Run 'python main.py init && python main.py index'.", file=stderr)
 
-        collections["tr369_standards"] = tr369_client.get_collection("tr369_standards")
-        collections["tr369_protocols"] = tr369_client.get_collection("tr369_protocols")
-        print("✅ TR-369 (USP) collections loaded", file=stderr)
-    except Exception as e:
-        print(f"⚠️  TR-369 collections not found: {e}", file=stderr)
-        print("   Please run: python indexer.py --protocols tr369", file=stderr)
 
-    # Initialize shared collections (TR-181)
-    try:
-        shared_client = chromadb.PersistentClient(path=str(DATA_DIR / "shared/vector_db"))
-        chroma_clients["shared"] = shared_client
+def _semantic_search(collection_name: str, query: str, top_k: int = 5) -> str:
+    """Run semantic search on a ChromaDB collection."""
+    collection = collections.get(collection_name)
+    if collection is None:
+        return f"Collection '{collection_name}' not available. Run 'python main.py index'."
 
-        collections["shared_data_models"] = shared_client.get_collection("shared_data_models")
-        print("✅ Shared data models (TR-181) loaded", file=stderr)
-    except Exception as e:
-        print(f"⚠️  Shared data models not found: {e}", file=stderr)
-        print("   Please run: python indexer.py --protocols shared", file=stderr)
+    if model is None:
+        return "Embedding model not loaded."
 
-    if not collections:
-        print("⚠️  No collections loaded. Please run indexer.py first.", file=stderr)
+    query_embedding = model.encode(query).tolist()
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["metadatas", "documents", "distances"],
+    )
+
+    if not results["documents"][0]:
+        return "No results found."
+
+    output_parts = []
+    for i, doc in enumerate(results["documents"][0]):
+        meta = results["metadatas"][0][i] if results["metadatas"] else {}
+        dist = results["distances"][0][i] if results.get("distances") else None
+
+        header = f"**[{i+1}]**"
+        if meta.get("path"):
+            header += f" `{meta['path']}`"
+        if meta.get("source"):
+            header += f" ({meta['source']})"
+        if dist is not None:
+            header += f" — {1 - dist:.0%}"
+
+        output_parts.append(f"{header}\n{doc}")
+
+    return "\n\n---\n\n".join(output_parts)
+
+
+def _format_param(obj_path: str, param) -> dict:
+    """Format a parameter for JSON output."""
+    result = {
+        "path": f"{obj_path}{param.name}",
+        "type": param.data_type,
+        "access": param.access,
+    }
+    if param.description:
+        result["description"] = param.description
+    if param.enumerations:
+        result["values"] = param.enumerations
+    if param.range_min is not None or param.range_max is not None:
+        result["range"] = {"min": param.range_min, "max": param.range_max}
+    if param.default is not None:
+        result["default"] = param.default
+    return result
+
+
+def _format_object(obj) -> dict:
+    """Format an object for JSON output."""
+    result = {
+        "path": obj.name,
+        "access": obj.access,
+        "multi_instance": obj.is_multi_instance,
+    }
+    if obj.is_multi_instance:
+        result["max_entries"] = obj.max_entries
+    if obj.description:
+        result["description"] = obj.description
+    result["parameter_count"] = len(obj.parameters)
+    return result
+
+
+def _truncate(text: str, max_chars: int = 80000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n[Truncated. Total: {len(text)} chars]"
 
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available tools."""
     return [
-        # TR-069 (CWMP) Tools
         Tool(
-            name="search_tr069_standard",
+            name="search_datamodel",
             description=(
-                "Search TR-069 (CWMP) standard specification documents. "
-                "Returns relevant sections from the TR-069 protocol specification. "
-                "Use for: understanding CWMP protocol details, RPC methods, "
-                "session management, fault codes, authentication mechanisms."
+                "Semantic search over CWMP and USP data model objects and parameters. "
+                "Use for: finding device parameters by description, discovering objects "
+                "related to a feature (WiFi, Ethernet, NAT, etc.), understanding parameter "
+                "types and constraints. Returns objects and parameters with their paths, "
+                "types, and descriptions."
             ),
             inputSchema={
                 "type": "object",
@@ -98,119 +184,93 @@ async def list_tools() -> list[Tool]:
                     "query": {
                         "type": "string",
                         "description": (
-                            "Search query for TR-069 standard. Examples: "
-                            "'GetParameterValues RPC', 'CWMP session establishment', "
-                            "'fault code 9005', 'HTTP authentication'"
-                        )
+                            "Semantic query. Examples: 'WiFi SSID parameters', "
+                            "'NAT port mapping', 'device manufacturer info'"
+                        ),
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["cwmp", "usp"],
+                        "description": "Filter by protocol. Omit to search both.",
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
+                        "description": "Number of results (default: 10)",
+                        "default": 10,
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+            },
         ),
         Tool(
-            name="search_tr069_data_models",
+            name="get_parameter",
             description=(
-                "Search TR-069 data models (TR-098 and related). "
-                "Returns relevant data model object definitions and parameters. "
-                "Use for: finding device parameters, understanding object hierarchies, "
-                "parameter access types, data types, and parameter descriptions. "
-                "Examples: Device.WiFi, InternetGatewayDevice, parameter constraints."
+                "Get exact data model parameter or object by its full path. "
+                "Returns complete metadata: type, access, description, constraints. "
+                "Use when you know the exact path like 'Device.WiFi.SSID.{i}.SSID' "
+                "or 'Device.DeviceInfo.Manufacturer'."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "path": {
                         "type": "string",
                         "description": (
-                            "Search query for TR-098 data models. Examples: "
-                            "'Device.WiFi.SSID', 'InternetGatewayDevice.WANDevice', "
-                            "'SSID parameters', 'WiFi radio configuration'"
-                        )
+                            "Full data model path. Examples: "
+                            "'Device.WiFi.SSID.{i}.SSID', 'Device.DeviceInfo.', "
+                            "'Device.ManagementServer.URL'"
+                        ),
                     },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["cwmp", "usp"],
+                        "description": "Protocol to look up in (default: cwmp)",
+                        "default": "cwmp",
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["path"],
+            },
         ),
         Tool(
-            name="search_tr069_protocols",
+            name="list_objects",
             description=(
-                "Search TR-069 CWMP protocol definitions (XSD/XML schemas). "
-                "Returns SOAP/XML schema definitions for CWMP messages and structures. "
-                "Use for: understanding CWMP message formats, RPC structures, "
-                "parameter structures, fault definitions, XML namespaces, "
-                "and SOAP envelope formats. Examples: cwmp:Inform, "
-                "ParameterValueStruct, SetParameterValuesResponse schema."
+                "List direct child objects of a data model path. "
+                "Use for navigating the data model tree. "
+                "Example: 'Device.' returns Device.DeviceInfo., Device.WiFi., etc."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "path": {
                         "type": "string",
                         "description": (
-                            "Search query for CWMP XSD/XML. Examples: "
-                            "'cwmp:Inform', 'ParameterValueStruct', "
-                            "'SetParameterValues schema', 'Fault structure'"
-                        )
+                            "Parent object path (with trailing dot). "
+                            "Examples: 'Device.', 'Device.WiFi.', "
+                            "'InternetGatewayDevice.'"
+                        ),
                     },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }
-        ),
-
-        # TR-369 (USP) Tools
-        Tool(
-            name="search_tr369_standard",
-            description=(
-                "Search TR-369 (USP) standard specification documents. "
-                "Returns relevant sections from the USP protocol specification. "
-                "Use for: understanding USP protocol details, message types, "
-                "MTP (Message Transfer Protocols), E2E security, discovery, "
-                "subscription mechanisms, USP Record/Message structure."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
+                    "protocol": {
                         "type": "string",
-                        "description": (
-                            "Search query for TR-369 standard. Examples: "
-                            "'USP Get message', 'STOMP MTP', 'E2E session context', "
-                            "'subscription notifications', 'USP Record encoding'"
-                        )
+                        "enum": ["cwmp", "usp"],
+                        "description": "Protocol (default: cwmp)",
+                        "default": "cwmp",
                     },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
+                    "include_params": {
+                        "type": "boolean",
+                        "description": "Also list parameters of the parent object (default: false)",
+                        "default": False,
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["path"],
+            },
         ),
         Tool(
-            name="search_tr369_protocols",
+            name="search_usp_spec",
             description=(
-                "Search TR-369 USP protocol definitions (protobuf schemas). "
-                "Returns protobuf message definitions for USP. "
-                "Use for: understanding USP message structures, field definitions, "
-                "message encoding, Request/Response structures, Error definitions, "
-                "and protobuf message types. Examples: Get, Set, Add, Delete, "
-                "Operate requests, Notify messages."
+                "Search the USP (TR-369) specification. "
+                "Returns relevant sections from the USP spec covering: "
+                "architecture, messages, MTPs (STOMP, MQTT, WebSocket), "
+                "security, discovery, E2E message exchange, software module management."
             ),
             inputSchema={
                 "type": "object",
@@ -218,31 +278,26 @@ async def list_tools() -> list[Tool]:
                     "query": {
                         "type": "string",
                         "description": (
-                            "Search query for USP protobuf definitions. Examples: "
-                            "'Get message proto', 'Set request structure', "
-                            "'Notify message', 'Error proto definition'"
-                        )
+                            "Search query. Examples: 'STOMP MTP binding', "
+                            "'USP Record structure', 'subscription notifications'"
+                        ),
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
+                        "description": "Number of results (default: 5)",
+                        "default": 5,
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+            },
         ),
-
-        # Shared Tools
         Tool(
-            name="search_shared_data_models",
+            name="search_protocol_schema",
             description=(
-                "Search shared data models (TR-181 Device:2). "
-                "TR-181 is the unified data model used by both TR-069 and TR-369. "
-                "Returns data model object definitions, parameters, events, and commands. "
-                "Use for: finding device parameters, understanding object hierarchies, "
-                "multi-instance objects, parameter types, and USP commands/events. "
-                "Examples: Device.WiFi, Device.Ethernet, Device.LocalAgent."
+                "Search protocol schema definitions. "
+                "For CWMP: XSD schemas defining SOAP/XML message structures. "
+                "For USP: protobuf schemas defining USP Message/Record structures. "
+                "Use for: message formats, RPC structures, field definitions."
             ),
             inputSchema={
                 "type": "object",
@@ -250,149 +305,171 @@ async def list_tools() -> list[Tool]:
                     "query": {
                         "type": "string",
                         "description": (
-                            "Search query for TR-181 data models. Examples: "
-                            "'Device.WiFi.Radio', 'Device.LocalAgent.Controller', "
-                            "'WiFi AccessPoint parameters', 'Device.IP.Interface'"
-                        )
+                            "Search query. Examples: 'Inform RPC', "
+                            "'Get message proto', 'ParameterValueStruct'"
+                        ),
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["cwmp", "usp"],
+                        "description": "Protocol to search (default: both)",
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default: 5)",
-                        "default": 5
-                    }
+                        "description": "Number of results (default: 5)",
+                        "default": 5,
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+            },
         ),
     ]
 
 
-def truncate_output(text: str, max_tokens: int = 20000) -> str:
-    """
-    Truncate output to avoid exceeding token limits.
-    Rough estimate: 1 token ≈ 4 characters
-    """
-    max_chars = max_tokens * 4
-    if len(text) <= max_chars:
-        return text
-
-    truncated = text[:max_chars]
-    return truncated + f"\n\n[... Output truncated. Total: {len(text)} chars, showing first {max_chars} ...]"
-
-
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
-    """Handle tool calls."""
-    if model is None:
-        return [TextContent(
-            type="text",
-            text="⚠️ Embedding model not initialized. Please check server logs."
-        )]
+    try:
+        result = _handle_tool(name, arguments)
+    except Exception as e:
+        result = f"Error: {e}"
+    return [TextContent(type="text", text=_truncate(result))]
 
-    query = arguments["query"]
-    top_k = arguments.get("top_k", 5)
 
-    # Map tool names to collection names
-    tool_to_collection = {
-        "search_tr069_standard": "tr069_standards",
-        "search_tr069_data_models": "tr069_data_models",
-        "search_tr069_protocols": "tr069_protocols",
-        "search_tr369_standard": "tr369_standards",
-        "search_tr369_protocols": "tr369_protocols",
-        "search_shared_data_models": "shared_data_models",
-    }
-
-    collection_name = tool_to_collection.get(name)
-    if not collection_name:
+def _handle_tool(name: str, arguments: dict) -> str:
+    if name == "search_datamodel":
+        return _tool_search_datamodel(arguments)
+    elif name == "get_parameter":
+        return _tool_get_parameter(arguments)
+    elif name == "list_objects":
+        return _tool_list_objects(arguments)
+    elif name == "search_usp_spec":
+        return _tool_search_usp_spec(arguments)
+    elif name == "search_protocol_schema":
+        return _tool_search_protocol_schema(arguments)
+    else:
         raise ValueError(f"Unknown tool: {name}")
 
-    collection = collections.get(collection_name)
-    if collection is None:
-        protocol = "TR-069" if "tr069" in name else "TR-369" if "tr369" in name else "Shared"
-        return [TextContent(
-            type="text",
-            text=f"⚠️ {protocol} collection '{collection_name}' not initialized.\n"
-                 f"Please run: python indexer.py"
-        )]
 
-    # Generate query embedding
-    query_embedding = model.encode(query).tolist()
+def _tool_search_datamodel(args: dict) -> str:
+    query = args["query"]
+    protocol = args.get("protocol")
+    top_k = args.get("top_k", 10)
 
-    # Search collection
-    try:
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["metadatas", "documents", "distances"]
-        )
-    except Exception as e:
-        return [TextContent(
-            type="text",
-            text=f"⚠️ Error searching collection: {e}"
-        )]
+    results = []
+    if protocol in (None, "cwmp"):
+        r = _semantic_search("cwmp_datamodel", query, top_k)
+        if r != "No results found.":
+            results.append(f"## CWMP Data Model\n\n{r}")
+    if protocol in (None, "usp"):
+        r = _semantic_search("usp_datamodel", query, top_k)
+        if r != "No results found.":
+            results.append(f"## USP Data Model\n\n{r}")
 
-    # Format output
-    protocol_name = {
-        "tr069_standards": "TR-069 (CWMP) Standard",
-        "tr069_data_models": "TR-069 Data Models (TR-098)",
-        "tr069_protocols": "TR-069 CWMP Protocols (XSD/XML)",
-        "tr369_standards": "TR-369 (USP) Standard",
-        "tr369_protocols": "TR-369 USP Protocols (Protobuf)",
-        "shared_data_models": "Shared Data Models (TR-181)",
-    }[collection_name]
+    return "\n\n".join(results) if results else "No results found."
 
-    output = f"# Search Results: '{query}'\n"
-    output += f"**Source:** {protocol_name}\n"
-    output += f"**Results:** {len(results['documents'][0])}\n\n"
-    output += "---\n\n"
 
-    if not results['documents'][0]:
-        output += "No results found.\n"
-    else:
-        for i, doc in enumerate(results['documents'][0]):
-            metadata = results['metadatas'][0][i] if results['metadatas'] else {}
-            distance = results['distances'][0][i] if results.get('distances') else None
+def _tool_get_parameter(args: dict) -> str:
+    path = args["path"]
+    protocol = args.get("protocol", "cwmp")
 
-            # Add metadata info if available
-            if metadata:
-                source = metadata.get('source', 'Unknown')
-                source_path = Path(source)
-                output += f"**[Result {i+1}]** {source_path.name}\n"
+    # Find the right DataModel
+    dm = data_models.get(protocol)
+    if dm is None:
+        # Try cwmp-tr098 for InternetGatewayDevice paths
+        if path.startswith("InternetGatewayDevice"):
+            dm = data_models.get("cwmp-tr098")
+        if dm is None:
+            return f"No data model loaded for protocol '{protocol}'."
 
-                if 'chunk' in metadata:
-                    output += f"*Chunk: {metadata['chunk']}*\n\n"
-                else:
-                    output += "\n"
+    # Try as parameter first
+    param = dm.get_parameter(path)
+    if param:
+        obj_path = path.rsplit(".", 1)[0] + "."
+        return json.dumps(_format_param(obj_path, param), indent=2)
 
-            # Add relevance score
-            if distance is not None:
-                output += f"*Relevance: {1 - distance:.2%}*\n\n"
+    # Try as object (ensure trailing dot)
+    obj_path = path if path.endswith(".") else path + "."
+    obj = dm.get_object(obj_path)
+    if obj:
+        result = _format_object(obj)
+        result["parameters"] = [
+            _format_param(obj_path, p) for p in obj.parameters.values()
+        ]
+        return json.dumps(result, indent=2)
 
-            # Add document content
-            output += f"{doc}\n\n"
-            output += "---\n\n"
+    return f"Path '{path}' not found in {protocol} data model."
 
-    # Truncate if needed
-    output = truncate_output(output)
-    return [TextContent(type="text", text=output)]
+
+def _tool_list_objects(args: dict) -> str:
+    path = args["path"]
+    protocol = args.get("protocol", "cwmp")
+    include_params = args.get("include_params", False)
+
+    dm = data_models.get(protocol)
+    if dm is None:
+        if path.startswith("InternetGatewayDevice"):
+            dm = data_models.get("cwmp-tr098")
+        if dm is None:
+            return f"No data model loaded for protocol '{protocol}'."
+
+    # Ensure trailing dot
+    if not path.endswith("."):
+        path += "."
+
+    children = dm.list_children(path)
+    if not children:
+        return f"No child objects under '{path}'."
+
+    result = {"parent": path, "children": [_format_object(c) for c in children]}
+
+    if include_params:
+        obj = dm.get_object(path)
+        if obj and obj.parameters:
+            result["parameters"] = [
+                _format_param(path, p) for p in obj.parameters.values()
+            ]
+
+    return json.dumps(result, indent=2)
+
+
+def _tool_search_usp_spec(args: dict) -> str:
+    return _semantic_search("usp_spec", args["query"], args.get("top_k", 5))
+
+
+def _tool_search_protocol_schema(args: dict) -> str:
+    query = args["query"]
+    protocol = args.get("protocol")
+    top_k = args.get("top_k", 5)
+
+    results = []
+    if protocol in (None, "cwmp"):
+        r = _semantic_search("cwmp_protocols", query, top_k)
+        if r != "No results found.":
+            results.append(f"## CWMP Schema (XSD)\n\n{r}")
+    if protocol in (None, "usp"):
+        r = _semantic_search("usp_protocols", query, top_k)
+        if r != "No results found.":
+            results.append(f"## USP Schema (Protobuf)\n\n{r}")
+
+    return "\n\n".join(results) if results else "No results found."
 
 
 async def main():
     """Run the MCP server."""
-    print("=" * 80, file=stderr)
-    print("TR-069 (CWMP) & TR-369 (USP) MCP Server", file=stderr)
-    print("=" * 80, file=stderr)
+    print("=" * 60, file=stderr)
+    print("BBF CWMP/USP MCP Server", file=stderr)
+    print("=" * 60, file=stderr)
 
-    init_vector_store()
+    init_server()
 
-    print("\n🚀 Server ready", file=stderr)
-    print("=" * 80, file=stderr)
+    print("\nServer ready", file=stderr)
+    print("=" * 60, file=stderr)
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
             write_stream,
-            app.create_initialization_options()
+            app.create_initialization_options(),
         )
 
 

@@ -1,0 +1,11 @@
+{
+  "name": "bbf-cwmp-usp",
+  "version": "1.0.0",
+  "description": "MCP server with semantic search, exact parameter lookup, and tree navigation over TR-181, TR-098, and USP specs",
+  "author": {
+    "name": "Stechs",
+    "email": "aprincipe@stechs.com"
+  },
+  "license": "MIT",
+  "keywords": ["broadband-forum", "cwmp", "tr-069", "usp", "tr-369", "tr-181", "data-model"]
+}

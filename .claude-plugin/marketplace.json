@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "plugins",
-  "description": "Broadband Forum CWMP/USP data model and protocol tools",
+  "description": "Collection of Claude Code plugins for broadband protocols and development tooling",
   "owner": {
     "name": "Stechs",
     "email": "aprincipe@stechs.com"
@@ -16,6 +16,16 @@
         "email": "aprincipe@stechs.com"
       },
       "source": "./plugins/bbf-cwmp-usp",
+      "category": "development"
+    },
+    {
+      "name": "statusline-monitor",
+      "description": "Context & usage monitor statusline showing model, active task, directory, context window, token counts, API usage limits, cost, and session duration",
+      "version": "1.0.0",
+      "author": {
+        "name": "aprincipe"
+      },
+      "source": "./plugins/statusline-monitor",
       "category": "development"
     }
   ]

@@ -1,0 +1,10 @@
+{
+  "name": "statusline-monitor",
+  "version": "1.0.0",
+  "description": "Context & usage monitor statusline for Claude Code. Shows model, active task, directory, context window usage, token counts, API usage limits (5h/7d), cost, and session duration.",
+  "author": {
+    "name": "aprincipe"
+  },
+  "license": "MIT",
+  "keywords": ["statusline", "monitoring", "usage", "context-window"]
+}
